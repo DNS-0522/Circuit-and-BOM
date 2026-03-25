@@ -110,6 +110,8 @@ export default function App() {
     if (file && file.type === 'application/pdf') {
       setPdfFile(file);
       setError(null);
+      setSelectedDesignator(null);
+      setSelectedGroup(null);
       loadPdf(file);
     } else {
       setError('Please upload a valid PDF file.');
@@ -133,6 +135,8 @@ export default function App() {
   const handleBomUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      setSelectedDesignator(null);
+      setSelectedGroup(null);
       const isTextFile = file.name.endsWith('.txt') || file.type === 'text/plain';
       
       if (isTextFile) {
@@ -443,6 +447,47 @@ export default function App() {
       }
     }
   }, [selectedDesignator, selectedGroup, pdfPageTexts, numPages]);
+
+  // Auto-zoom when selecting a component
+  useEffect(() => {
+    if (selectedDesignator) {
+      setScale(prev => Math.max(prev, 2.5));
+    }
+  }, [selectedDesignator]);
+
+  // Auto-scroll to selected component
+  useEffect(() => {
+    if (selectedDesignator && matches.length > 0 && containerRef.current) {
+      const match = matches.find(m => {
+        const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`\\b${escapeRegExp(selectedDesignator)}[A-Za-z]*\\b`, 'i');
+        return regex.test(m.text) || m.text === selectedDesignator;
+      });
+
+      if (match) {
+        // Calculate coordinates on the canvas
+        const tx = pdfjsLib.Util.transform(
+          pdfjsLib.Util.transform(match.viewport.transform, match.transform),
+          [1, 0, 0, -1, 0, 0]
+        );
+
+        const currentScale = match.viewport.scale;
+        const x = tx[4];
+        const y = tx[5] - match.height * currentScale;
+
+        // Center the match in the container
+        const container = containerRef.current;
+        const scrollX = x - container.clientWidth / 2 + (match.width * currentScale) / 2;
+        const scrollY = y - container.clientHeight / 2 + (match.height * currentScale) / 2;
+
+        container.scrollTo({
+          left: Math.max(0, scrollX),
+          top: Math.max(0, scrollY),
+          behavior: 'smooth'
+        });
+      }
+    }
+  }, [selectedDesignator, matches]);
 
   const searchAndHighlight = async (page: pdfjsLib.PDFPageProxy, viewport: pdfjsLib.PageViewport, searchTerms: string[]) => {
     const textContent = await page.getTextContent();
