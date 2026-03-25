@@ -1,0 +1,5 @@
+{
+  "name": "Circuit Inspector",
+  "description": "Upload PDF schematics and BOM files to automatically highlight and inspect components on the diagram.",
+  "requestFramePermissions": []
+}
