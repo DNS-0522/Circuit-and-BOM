@@ -430,7 +430,8 @@ export default function App() {
       setCurrentPage(prev => (prev !== selectedGroup && selectedGroup <= numPages) ? selectedGroup : prev);
     } else if (selectedDesignator && pdfPageTexts.length > 0) {
       const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const regex = new RegExp(`\\b${escapeRegExp(selectedDesignator)}\\b`, 'i');
+      // Allow optional letter suffix (e.g., Q0301 matching Q0301A, Q0301B, etc.)
+      const regex = new RegExp(`\\b${escapeRegExp(selectedDesignator)}[A-Za-z]*\\b`, 'i');
       
       const pageIndex = pdfPageTexts.findIndex(pageItems => 
         pageItems.some(str => regex.test(str) || str === selectedDesignator)
@@ -452,7 +453,8 @@ export default function App() {
     const foundMatches: MatchResult[] = [];
     
     const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regexes = searchTerms.map(term => new RegExp(`\\b${escapeRegExp(term)}\\b`, 'i'));
+    // Allow optional letter suffix (e.g., Q0301 matching Q0301A, Q0301B, etc.)
+    const regexes = searchTerms.map(term => new RegExp(`\\b${escapeRegExp(term)}[A-Za-z]*\\b`, 'i'));
 
     textContent.items.forEach((item: any) => {
       if ('str' in item) {
@@ -489,7 +491,7 @@ export default function App() {
 
   return (
     <div className={cn(
-      "min-h-screen flex flex-col font-sans transition-colors duration-300",
+      "h-screen flex flex-col font-sans transition-colors duration-300 overflow-hidden",
       isDarkMode ? "bg-neutral-900 text-neutral-100 dark" : "bg-neutral-100 text-neutral-900"
     )}>
       {/* Header */}
@@ -871,16 +873,6 @@ export default function App() {
         </div>
       </main>
 
-      {error && (
-        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-red-600 text-white px-6 py-3 rounded-full shadow-lg flex items-center gap-3 z-50 animate-bounce">
-          <AlertCircle className="w-5 h-5" />
-          <span className="text-sm font-medium">{error}</span>
-          <button onClick={() => setError(null)} className="ml-2 hover:bg-red-700 rounded-full p-1">
-            <ChevronRight className="w-4 h-4 rotate-90" />
-          </button>
-        </div>
-      )}
-
       {/* Debug Modal */}
       {showDebugModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
@@ -929,6 +921,17 @@ export default function App() {
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Error Message Overlay */}
+      {error && (
+        <div className="fixed bottom-6 right-6 bg-red-600 text-white px-6 py-3 rounded-full shadow-lg flex items-center gap-3 z-[100] animate-bounce">
+          <AlertCircle className="w-5 h-5" />
+          <span className="text-sm font-medium">{error}</span>
+          <button onClick={() => setError(null)} className="ml-2 hover:bg-red-700 rounded-full p-1">
+            <ChevronRight className="w-4 h-4 rotate-90" />
+          </button>
         </div>
       )}
     </div>
