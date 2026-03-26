@@ -7,7 +7,7 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
-import { Upload, FileText, Search, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, ChevronDown, Info, AlertCircle, Sun, Moon, Bug, X } from 'lucide-react';
+import { Upload, FileText, Search, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, ChevronDown, Info, AlertCircle, Sun, Moon, Bug, X, Map, Check } from 'lucide-react';
 import { cn } from './lib/utils';
 
 // Set up PDF.js worker
@@ -87,8 +87,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [showDebugModal, setShowDebugModal] = useState(false);
+  const [showMinimap, setShowMinimap] = useState(true);
+  const [viewportRect, setViewportRect] = useState({ top: 0, left: 0, width: 0, height: 0 });
+  const [componentStatuses, setComponentStatuses] = useState<Record<string, 'confirmed' | 'doubtful'>>({});
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const minimapCanvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const groupedBomData = useMemo(() => {
@@ -120,7 +124,163 @@ export default function App() {
     return sortedGroups;
   }, [bomData]);
 
+  // Update viewport rect for minimap
+  useEffect(() => {
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
+
+    const updateViewport = () => {
+      const { scrollTop, scrollLeft, clientWidth, clientHeight } = container;
+      const { width: canvasWidth, height: canvasHeight } = canvas;
+      
+      setViewportRect({
+        top: (scrollTop / canvasHeight) * 100,
+        left: (scrollLeft / canvasWidth) * 100,
+        width: (clientWidth / canvasWidth) * 100,
+        height: (clientHeight / canvasHeight) * 100
+      });
+    };
+
+    container.addEventListener('scroll', updateViewport);
+    window.addEventListener('resize', updateViewport);
+    updateViewport();
+
+    // Also update when scale or page changes
+    const timeout = setTimeout(updateViewport, 100);
+
+    return () => {
+      container.removeEventListener('scroll', updateViewport);
+      window.removeEventListener('resize', updateViewport);
+      clearTimeout(timeout);
+    };
+  }, [pdfDoc, currentPage, scale, isLoading, matches]);
+
+  // Render Minimap Thumbnail
+  useEffect(() => {
+    if (!pdfDoc || !minimapCanvasRef.current || !showMinimap) return;
+
+    const renderMinimap = async () => {
+      try {
+        const page = await pdfDoc.getPage(currentPage);
+        const minimapCanvas = minimapCanvasRef.current!;
+        const ctx = minimapCanvas.getContext('2d')!;
+        
+        // Fixed width for minimap thumbnail
+        const minimapWidth = 180;
+        const viewport = page.getViewport({ scale: 1 });
+        const minimapScale = minimapWidth / viewport.width;
+        const minimapViewport = page.getViewport({ scale: minimapScale });
+
+        minimapCanvas.width = minimapViewport.width;
+        minimapCanvas.height = minimapViewport.height;
+
+        await page.render({
+          canvasContext: ctx,
+          viewport: minimapViewport
+        }).promise;
+      } catch (err) {
+        console.error("Error rendering minimap:", err);
+      }
+    };
+
+    renderMinimap();
+  }, [pdfDoc, currentPage, showMinimap]);
+
+  const handleMinimapClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    const minimapCanvas = minimapCanvasRef.current;
+    if (!container || !canvas || !minimapCanvas) return;
+
+    const rect = minimapCanvas.getBoundingClientRect();
+    const clickX = (e.clientX - rect.left) / rect.width;
+    const clickY = (e.clientY - rect.top) / rect.height;
+
+    const targetScrollLeft = clickX * canvas.width - container.clientWidth / 2;
+    const targetScrollTop = clickY * canvas.height - container.clientHeight / 2;
+
+    container.scrollTo({
+      left: Math.max(0, targetScrollLeft),
+      top: Math.max(0, targetScrollTop),
+      behavior: 'smooth'
+    });
+  };
+
   // Handle PDF Upload
+  const handleCanvasClick = async (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!pdfDoc || !canvasRef.current) return;
+
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+    const page = await pdfDoc.getPage(currentPage);
+    const viewport = page.getViewport({ scale });
+    const textContent = await page.getTextContent();
+
+    for (const item of textContent.items as any[]) {
+      if (!('str' in item)) continue;
+
+      const tx = pdfjsLib.Util.transform(
+        pdfjsLib.Util.transform(viewport.transform, item.transform),
+        [1, 0, 0, -1, 0, 0]
+      );
+
+      const itemX = tx[4];
+      const itemY = tx[5] - item.height * scale;
+      const itemWidth = item.width * scale;
+      const itemHeight = item.height * scale;
+
+      const padding = 10;
+      if (
+        x >= itemX - padding &&
+        x <= itemX + itemWidth + padding &&
+        y >= itemY - padding &&
+        y <= itemY + itemHeight + padding
+      ) {
+        const text = item.str.trim();
+        const found = bomData.find(entry => {
+          const ref = entry["Part Reference"];
+          const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const regex = new RegExp(`^${escapeRegExp(ref)}[A-Za-z]*$`, 'i');
+          return regex.test(text) || text === ref;
+        });
+
+        if (found) {
+          setSelectedDesignator(found["Part Reference"]);
+          setSelectedGroup(null);
+          return;
+        }
+      }
+    }
+  };
+
+  // Auto-scroll BOM list when a designator is selected
+  useEffect(() => {
+    if (selectedDesignator) {
+      const group = groupedBomData.find(g => 
+        g.entries.some(e => e["Part Reference"] === selectedDesignator)
+      );
+      
+      if (group) {
+        setExpandedGroups(prev => {
+          const next = new Set(prev);
+          next.add(group.page);
+          return next;
+        });
+        
+        setTimeout(() => {
+          const element = document.getElementById(`bom-item-${selectedDesignator}`);
+          if (element) {
+            element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+        }, 150);
+      }
+    }
+  }, [selectedDesignator, groupedBomData]);
+
   const handlePdfUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file && file.type === 'application/pdf') {
@@ -549,13 +709,22 @@ export default function App() {
           if (added.length > 0) await searchAndHighlight(page, viewport, added, '#22c55e'); // Green
           if (removed.length > 0) await searchAndHighlight(page, viewport, removed, '#ef4444'); // Red
           if (modified.length > 0) await searchAndHighlight(page, viewport, modified, '#f59e0b'); // Amber
-        } else if (selectedDesignator) {
-          searchAndHighlight(page, viewport, [selectedDesignator]);
-        } else if (selectedGroup !== null) {
-          const group = groupedBomData.find(g => g.page === selectedGroup);
-          if (group) {
-            const terms = group.entries.map(e => e["Part Reference"]);
-            searchAndHighlight(page, viewport, terms);
+        } else {
+          // Highlight all components with statuses on this page
+          const confirmed = Object.keys(componentStatuses).filter(d => componentStatuses[d] === 'confirmed');
+          const doubtful = Object.keys(componentStatuses).filter(d => componentStatuses[d] === 'doubtful');
+          
+          if (confirmed.length > 0) await searchAndHighlight(page, viewport, confirmed, '#22c55e');
+          if (doubtful.length > 0) await searchAndHighlight(page, viewport, doubtful, '#ef4444');
+
+          if (selectedDesignator) {
+            searchAndHighlight(page, viewport, [selectedDesignator], '#3b82f6', true); // Blue for selection
+          } else if (selectedGroup !== null) {
+            const group = groupedBomData.find(g => g.page === selectedGroup);
+            if (group) {
+              const terms = group.entries.map(e => e["Part Reference"]);
+              searchAndHighlight(page, viewport, terms, '#3b82f6', true); // Blue for selection
+            }
           }
         }
       } catch (error: any) {
@@ -575,7 +744,7 @@ export default function App() {
         renderTask.cancel();
       }
     };
-  }, [pdfDoc, currentPage, scale, selectedDesignator, selectedGroup, groupedBomData, isLoading, isComparing, comparisonResults]);
+  }, [pdfDoc, currentPage, scale, selectedDesignator, selectedGroup, groupedBomData, isLoading, isComparing, comparisonResults, componentStatuses]);
 
   useEffect(() => {
     if (selectedGroup !== null && selectedGroup !== 9999) {
@@ -637,7 +806,7 @@ export default function App() {
     }
   }, [selectedDesignator, matches]);
 
-  const searchAndHighlight = async (page: pdfjsLib.PDFPageProxy, viewport: pdfjsLib.PageViewport, searchTerms: string[], color: string = 'red') => {
+  const searchAndHighlight = async (page: pdfjsLib.PDFPageProxy, viewport: pdfjsLib.PageViewport, searchTerms: string[], color: string = 'red', isSelection: boolean = false) => {
     const textContent = await page.getTextContent();
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -660,8 +829,14 @@ export default function App() {
 
           // Draw highlight
           ctx.strokeStyle = color;
-          ctx.lineWidth = 2;
+          ctx.lineWidth = isSelection ? 4 : 2;
           ctx.strokeRect(tx[4], tx[5] - item.height * scale, item.width * scale, item.height * scale);
+          
+          if (isSelection) {
+            // Draw a semi-transparent fill for selection
+            ctx.fillStyle = color + '22'; // 22 is ~13% opacity
+            ctx.fillRect(tx[4], tx[5] - item.height * scale, item.width * scale, item.height * scale);
+          }
           
           foundMatches.push({
             pageNumber: currentPage,
@@ -894,6 +1069,37 @@ export default function App() {
                     Compare BOMs
                   </button>
                 )}
+                <div className={cn(
+                  "p-3 rounded-md border flex flex-col gap-2 mb-4",
+                  isDarkMode ? "bg-neutral-800/50 border-neutral-700" : "bg-neutral-50 border-neutral-200"
+                )}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] font-bold uppercase text-neutral-500">Status Legend</span>
+                    {Object.keys(componentStatuses).length > 0 && (
+                      <button 
+                        onClick={() => setComponentStatuses({})}
+                        className="text-[9px] underline hover:text-red-500 transition-colors"
+                      >
+                        Clear All
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-3">
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-2 h-2 rounded-full bg-green-500" />
+                      <span className="text-[10px]">Confirmed</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-2 h-2 rounded-full bg-red-500" />
+                      <span className="text-[10px]">Doubtful</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-2 h-2 rounded-full bg-blue-500" />
+                      <span className="text-[10px]">Selected</span>
+                    </div>
+                  </div>
+                </div>
+
                 {Object.keys(bomFiles).length > 0 && (
                   <div className="mb-4">
                     <label className="text-xs font-bold uppercase text-neutral-500">Active BOM</label>
@@ -958,6 +1164,7 @@ export default function App() {
                               return (
                                 <div 
                                   key={idx} 
+                                  id={`bom-item-${item["Part Reference"]}`}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     setSelectedDesignator(item["Part Reference"]);
@@ -967,24 +1174,84 @@ export default function App() {
                                     "p-3 rounded-md border text-sm cursor-pointer transition-all hover:shadow-sm",
                                     isSelected 
                                       ? (isDarkMode ? "bg-red-900/20 border-red-800 shadow-inner" : "bg-red-50 border-red-200 shadow-inner")
-                                      : (isDarkMode ? "bg-neutral-800/50 border-neutral-800 hover:bg-neutral-700" : "bg-white border-neutral-200 hover:border-neutral-300")
+                                      : (isDarkMode ? "bg-neutral-800/50 border-neutral-800 hover:bg-neutral-700" : "bg-white border-neutral-200 hover:border-neutral-300"),
+                                    componentStatuses[item["Part Reference"]] === 'confirmed' && "border-l-4 border-l-green-500",
+                                    componentStatuses[item["Part Reference"]] === 'doubtful' && "border-l-4 border-l-red-500"
                                   )}
                                 >
-                                  <div className="flex justify-between items-start mb-2">
-                                    <span className={cn(
-                                      "font-bold",
-                                      isSelected ? "text-red-500" : (isDarkMode ? "text-neutral-200" : "text-neutral-800")
-                                    )}>
-                                      {item["Part Reference"]}
-                                    </span>
-                                    {item["Optional"] && (
+                                  <div className="flex justify-between items-start mb-2 gap-2">
+                                    <div className="flex flex-wrap items-center gap-2 min-w-0">
                                       <span className={cn(
-                                        "text-[10px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wider",
-                                        isDarkMode ? "bg-amber-900/30 text-amber-400" : "bg-amber-100 text-amber-700"
+                                        "font-bold truncate",
+                                        isSelected ? "text-red-500" : (isDarkMode ? "text-neutral-200" : "text-neutral-800")
                                       )}>
-                                        {item["Optional"]}
+                                        {item["Part Reference"]}
                                       </span>
-                                    )}
+                                      {componentStatuses[item["Part Reference"]] && (
+                                        <span className={cn(
+                                          "text-[8px] px-1 py-0.5 rounded font-bold uppercase shrink-0",
+                                          componentStatuses[item["Part Reference"]] === 'confirmed' 
+                                            ? (isDarkMode ? "bg-green-900/40 text-green-400" : "bg-green-100 text-green-700")
+                                            : (isDarkMode ? "bg-red-900/40 text-red-400" : "bg-red-100 text-red-700")
+                                        )}>
+                                          {componentStatuses[item["Part Reference"]]}
+                                        </span>
+                                      )}
+                                      {item["Optional"] && (
+                                        <span className={cn(
+                                          "text-[8px] px-1 py-0.5 rounded font-medium uppercase tracking-wider shrink-0",
+                                          isDarkMode ? "bg-amber-900/30 text-amber-400" : "bg-amber-100 text-amber-700"
+                                        )}>
+                                          {item["Optional"]}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      <button 
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setComponentStatuses(prev => {
+                                            if (prev[item["Part Reference"]] === 'confirmed') {
+                                              const next = {...prev};
+                                              delete next[item["Part Reference"]];
+                                              return next;
+                                            }
+                                            return {...prev, [item["Part Reference"]]: 'confirmed'};
+                                          });
+                                        }}
+                                        className={cn(
+                                          "p-1 rounded transition-all",
+                                          componentStatuses[item["Part Reference"]] === 'confirmed'
+                                            ? "bg-green-500 text-white shadow-sm"
+                                            : (isDarkMode ? "text-neutral-600 hover:text-green-500 hover:bg-neutral-700" : "text-neutral-300 hover:text-green-600 hover:bg-neutral-100")
+                                        )}
+                                        title="Confirm"
+                                      >
+                                        <Check className="w-3 h-3" />
+                                      </button>
+                                      <button 
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setComponentStatuses(prev => {
+                                            if (prev[item["Part Reference"]] === 'doubtful') {
+                                              const next = {...prev};
+                                              delete next[item["Part Reference"]];
+                                              return next;
+                                            }
+                                            return {...prev, [item["Part Reference"]]: 'doubtful'};
+                                          });
+                                        }}
+                                        className={cn(
+                                          "p-1 rounded transition-all",
+                                          componentStatuses[item["Part Reference"]] === 'doubtful'
+                                            ? "bg-red-500 text-white shadow-sm"
+                                            : (isDarkMode ? "text-neutral-600 hover:text-red-500 hover:bg-neutral-700" : "text-neutral-300 hover:text-red-600 hover:bg-neutral-100")
+                                        )}
+                                        title="Doubt"
+                                      >
+                                        <AlertCircle className="w-3 h-3" />
+                                      </button>
+                                    </div>
                                   </div>
                                   <div className="grid grid-cols-1 gap-1 text-xs">
                                     <div className="flex justify-between items-center gap-2">
@@ -1019,6 +1286,60 @@ export default function App() {
           "flex-1 flex flex-col relative overflow-hidden transition-colors",
           isDarkMode ? "bg-neutral-900" : "bg-neutral-200"
         )}>
+          {/* Minimap Overlay */}
+          {pdfDoc && showMinimap && (
+            <div className={cn(
+              "absolute bottom-6 left-6 p-2 rounded-lg border shadow-xl z-30 transition-all duration-300 animate-in fade-in zoom-in-95",
+              isDarkMode ? "bg-neutral-800 border-neutral-700" : "bg-white border-neutral-200"
+            )}>
+              <div className="flex items-center justify-between mb-2 px-1">
+                <div className="flex items-center gap-1.5 opacity-60">
+                  <Map className="w-3 h-3" />
+                  <span className="text-[10px] font-bold uppercase tracking-wider">Navigator</span>
+                </div>
+                <button 
+                  onClick={() => setShowMinimap(false)} 
+                  className={cn(
+                    "p-0.5 rounded-full transition-colors",
+                    isDarkMode ? "hover:bg-neutral-700" : "hover:bg-neutral-100"
+                  )}
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+              <div 
+                className="relative cursor-pointer overflow-hidden rounded bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-700"
+                onClick={handleMinimapClick}
+              >
+                <canvas ref={minimapCanvasRef} className="block" />
+                {/* Viewport Highlight */}
+                <div 
+                  className="absolute border-2 border-red-500 bg-red-500/10 pointer-events-none transition-all duration-75"
+                  style={{
+                    top: `${viewportRect.top}%`,
+                    left: `${viewportRect.left}%`,
+                    width: `${Math.min(100, viewportRect.width)}%`,
+                    height: `${Math.min(100, viewportRect.height)}%`
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          
+          {/* Minimap Toggle (if hidden) */}
+          {pdfDoc && !showMinimap && (
+            <button 
+              onClick={() => setShowMinimap(true)}
+              title="Show Navigator"
+              className={cn(
+                "absolute bottom-6 left-6 p-2 rounded-full border shadow-lg z-30 transition-all hover:scale-110",
+                isDarkMode ? "bg-neutral-800 border-neutral-700 text-neutral-400" : "bg-white border-neutral-200 text-neutral-500"
+              )}
+            >
+              <Map className="w-4 h-4" />
+            </button>
+          )}
+
           {/* Toolbar */}
           <div className={cn(
             "backdrop-blur-md border-b p-2 flex items-center justify-between z-10 transition-colors",
@@ -1104,7 +1425,11 @@ export default function App() {
                 "inline-block relative shadow-2xl transition-all duration-500 text-left align-middle",
                 isDarkMode ? "bg-neutral-800 ring-1 ring-neutral-700" : "bg-white"
               )}>
-                <canvas ref={canvasRef} className="block" />
+                <canvas 
+                  ref={canvasRef} 
+                  className="block cursor-crosshair" 
+                  onClick={handleCanvasClick}
+                />
               </div>
             ) : (
               <div className="inline-flex flex-col items-center justify-center h-full text-neutral-400 max-w-md text-center">
@@ -1187,6 +1512,45 @@ export default function App() {
                   "pt-2 border-t",
                   isDarkMode ? "border-neutral-700" : "border-neutral-100"
                 )}>
+                  <div className="flex gap-2 mb-3">
+                    <button 
+                      onClick={() => setComponentStatuses(prev => ({...prev, [selectedDesignator]: 'confirmed'}))}
+                      className={cn(
+                        "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
+                        componentStatuses[selectedDesignator] === 'confirmed' 
+                          ? "bg-green-600 text-white shadow-lg scale-105" 
+                          : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
+                      )}
+                    >
+                      Confirm
+                    </button>
+                    <button 
+                      onClick={() => setComponentStatuses(prev => ({...prev, [selectedDesignator]: 'doubtful'}))}
+                      className={cn(
+                        "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
+                        componentStatuses[selectedDesignator] === 'doubtful' 
+                          ? "bg-red-600 text-white shadow-lg scale-105" 
+                          : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
+                      )}
+                    >
+                      Doubt
+                    </button>
+                    <button 
+                      onClick={() => setComponentStatuses(prev => {
+                        const next = {...prev};
+                        delete next[selectedDesignator];
+                        return next;
+                      })}
+                      className={cn(
+                        "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
+                        !componentStatuses[selectedDesignator] 
+                          ? (isDarkMode ? "bg-neutral-600 text-white" : "bg-neutral-300 text-neutral-700")
+                          : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
+                      )}
+                    >
+                      Reset
+                    </button>
+                  </div>
                   <p className="text-[10px] text-neutral-400 italic">
                     {matches.length > 0 
                       ? `Found ${matches.length} instance(s) on this page.`
