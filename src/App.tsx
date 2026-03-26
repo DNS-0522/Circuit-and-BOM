@@ -159,6 +159,166 @@ export default function App() {
         return String(val).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
       };
 
+      const processTextContent = (text: string, fileName: string) => {
+        // Strip BOM if present
+        if (text.charCodeAt(0) === 0xFEFF) {
+          text = text.substring(1);
+        }
+        const lines = text.split(/\r?\n/).filter(line => line.trim());
+        
+        if (lines.length === 0) return;
+
+        // Check if the first line looks like a header
+        const firstLine = lines[0];
+        const isTabSeparated = firstLine.includes('\t');
+        const isCommaSeparated = firstLine.includes(',');
+        const delimiter = isTabSeparated ? '\t' : (isCommaSeparated ? ',' : /\s{2,}/);
+        
+        // Split all lines into a grid
+        const grid = lines.map(line => line.split(delimiter).map(p => cleanString(p)));
+        
+        let refIdx = -1;
+        let pnIdx = -1;
+        let nameIdx = -1;
+        let optIdx = -1;
+
+        // Check if we have a valid grid
+        if (grid.length > 0) {
+          const numCols = Math.max(...grid.map(row => row.length));
+          
+          // If it's just 1 column, the delimiter is probably wrong, or it's unstructured
+          if (numCols > 1) {
+            // Analyze each column to guess its type
+            for (let col = 0; col < numCols; col++) {
+              let refScore = 0;
+              let pnScore = 0;
+              let nameScore = 0;
+              let optScore = 0;
+              
+              let validRows = 0;
+              
+              // Check up to 10 rows to determine column type
+              for (let row = 0; row < Math.min(grid.length, 10); row++) {
+                const cell = grid[row][col];
+                if (!cell) continue;
+                
+                // If it's the first row, check if it matches known headers
+                if (row === 0) {
+                  if (/Part[\s_]*Referenc|^Reference$|^RefDes$|^Designator$|^Ref$|^Location$|^Part$|插件位置/i.test(cell)) refScore += 10;
+                  if (/Part[\s_]*Number|^P\/?N$|^PN$|^Material$|^Item$|Item[\s_]*Number/i.test(cell)) pnScore += 10;
+                  if (/Component[\s_]*Name|^Name$|^Component$|^Value$|^Part[\s_]*Type$|Item[\s_]*Description/i.test(cell)) nameScore += 10;
+                  if (/Optional|^Opt$|^DNP$/i.test(cell)) optScore += 10;
+                }
+                
+                validRows++;
+                
+                // Data heuristics
+                if (/^[A-Z]{1,3}\d+[A-Z]?$/i.test(cell)) {
+                  refScore++;
+                } else if (/^[A-Z0-9-]{6,}$/i.test(cell) && !/\s/.test(cell) && !/OHM|FARAD|VOLT|WATT/i.test(cell)) {
+                  pnScore++;
+                } else if (/\s/.test(cell) || /OHM|FARAD|VOLT|WATT|RES|CAP|IND|MLCC/i.test(cell)) {
+                  nameScore++;
+                } else if (/^(N\/A|@|DNP|NO\s*STUFF|OPTIONAL)$/i.test(cell)) {
+                  optScore++;
+                }
+              }
+              
+              // Assign column based on highest score
+              if (validRows > 0) {
+                const maxScore = Math.max(refScore, pnScore, nameScore, optScore);
+                if (maxScore > 0) { // Only assign if there's some evidence
+                  if (maxScore === refScore && refIdx === -1) refIdx = col;
+                  else if (maxScore === pnScore && pnIdx === -1) pnIdx = col;
+                  else if (maxScore === nameScore && nameIdx === -1) nameIdx = col;
+                  else if (maxScore === optScore && optIdx === -1) optIdx = col;
+                }
+              }
+            }
+          }
+        }
+        
+        const processedData: BOMEntry[] = [];
+
+        if (refIdx !== -1 || pnIdx !== -1) {
+          // Structured parsing
+          // Check if the first row is a header row (if it doesn't match data heuristics)
+          let startRow = 0;
+          if (grid.length > 0) {
+            const firstRowRef = refIdx !== -1 ? grid[0][refIdx] : '';
+            const firstRowPn = pnIdx !== -1 ? grid[0][pnIdx] : '';
+            // If the first row's Ref doesn't look like a Ref, or PN doesn't look like a PN, it's probably a header
+            if ((firstRowRef && !/^[A-Z]{1,3}\d+[A-Z]?$/i.test(firstRowRef)) || 
+                (firstRowPn && !/^[A-Z0-9-]{6,}$/i.test(firstRowPn))) {
+              startRow = 1;
+            }
+          }
+
+          for (let i = startRow; i < grid.length; i++) {
+            const parts = grid[i];
+            if (parts.length === 0 || (parts.length === 1 && !parts[0])) continue;
+
+            const designatorRaw = refIdx !== -1 ? parts[refIdx] : '';
+            const partNumber = pnIdx !== -1 ? parts[pnIdx] : '';
+            
+            if (!designatorRaw && !partNumber) continue;
+
+            const designators = cleanString(designatorRaw).toUpperCase().split(',').map(d => d.trim()).filter(d => d);
+            
+            (designators.length > 0 ? designators : ['']).forEach(d => {
+              const entry: BOMEntry = {
+                "Part Reference": d,
+                "Part Number": cleanString(partNumber),
+                "Component_Name": nameIdx !== -1 ? cleanString(parts[nameIdx]) : '',
+                "Optional": optIdx !== -1 ? cleanString(parts[optIdx]) : '',
+                description: parts.join(' '),
+                originalLine: lines[i],
+                lineNumber: i + 1
+              };
+              processedData.push(entry);
+            });
+          }
+        } else {
+          // Fallback to regex-based parsing for unstructured text
+          const designatorRegex = /^[A-Z]{1,3}\d+[A-Z]?$/i;
+          const pnRegex = /^[A-Z0-9-]{6,}$/i;
+          
+          lines.forEach((line, index) => {
+            const parts = line.trim().split(/[\s,\t]+/);
+            let foundDesignators: string[] = [];
+            let foundPN = '';
+            let foundName: string[] = [];
+            
+            for (const part of parts) {
+              const cleanedPart = cleanString(part);
+              if (designatorRegex.test(cleanedPart) && !/OHM|FARAD|VOLT|WATT/i.test(cleanedPart)) {
+                foundDesignators.push(cleanedPart.toUpperCase());
+              } else if (!foundPN && pnRegex.test(cleanedPart) && !/OHM|FARAD|VOLT|WATT/i.test(cleanedPart)) {
+                foundPN = cleanedPart;
+              } else {
+                foundName.push(cleanedPart);
+              }
+            }
+            
+            if (foundDesignators.length > 0 || foundPN) {
+              (foundDesignators.length > 0 ? foundDesignators : ['']).forEach(d => {
+                processedData.push({
+                  "Part Reference": d,
+                  "Part Number": foundPN,
+                  "Component_Name": foundName.join(' '),
+                  description: cleanString(line),
+                  originalLine: cleanString(line),
+                  lineNumber: index + 1
+                });
+              });
+            }
+          });
+        }
+        
+        setBomFiles(prev => ({ ...prev, [fileName]: sortBOMData(processedData) }));
+        setActiveBom(fileName);
+      };
+
       Array.from(files).forEach((file: File) => {
         const isTextFile = file.name.endsWith('.txt') || file.type === 'text/plain';
         const isExcelFile = file.name.endsWith('.xlsx') || file.name.endsWith('.xls');
@@ -166,212 +326,66 @@ export default function App() {
         if (isExcelFile) {
           const reader = new FileReader();
           reader.onload = (event) => {
-            const data = new Uint8Array(event.target?.result as ArrayBuffer);
-            const workbook = XLSX.read(data, { type: 'array' });
-            const firstSheetName = workbook.SheetNames[0];
-            const worksheet = workbook.Sheets[firstSheetName];
-            const jsonData = XLSX.utils.sheet_to_json(worksheet);
-            
-            const processedData = jsonData.flatMap((row: any) => {
-              const designatorKey = Object.keys(row).find(k => 
-                /Part[\s_]*Reference|^designator$|^ref$|^reference$|^refdes$|^location$|^part$/i.test(cleanString(k))
-              );
-              const pnKey = Object.keys(row).find(k => 
-                /Part[\s_]*Number|^pn$|^p\/n$|^material$|^item$/i.test(cleanString(k))
-              );
-              const nameKey = Object.keys(row).find(k => 
-                /Component[\s_]*Name|^name$|^desc|^value$|^part[\s_]*type$/i.test(cleanString(k))
-              );
-              const optKey = Object.keys(row).find(k => 
-                /Optional|^opt$|^dnp$/i.test(cleanString(k))
-              );
+            try {
+              const data = new Uint8Array(event.target?.result as ArrayBuffer);
+              const workbook = XLSX.read(data, { type: 'array' });
+              const firstSheetName = workbook.SheetNames[0];
+              const worksheet = workbook.Sheets[firstSheetName];
+              const jsonData = XLSX.utils.sheet_to_json(worksheet);
               
-              const designatorRaw = cleanString(designatorKey ? row[designatorKey] : Object.values(row)[0]).toUpperCase();
-              const designators = designatorRaw.split(',').map(d => d.trim()).filter(d => d);
-              
-              if (designators.length === 0 && !pnKey) return [];
+              const processedData = jsonData.flatMap((row: any) => {
+                const designatorKey = Object.keys(row).find(k => 
+                  /Part[\s_]*Reference|^designator$|^ref$|^reference$|^refdes$|^location$|^part$|插件位置/i.test(cleanString(k))
+                );
+                const pnKey = Object.keys(row).find(k => 
+                  /Part[\s_]*Number|^pn$|^p\/n$|^material$|^item$|Item[\s_]*Number/i.test(cleanString(k))
+                );
+                const nameKey = Object.keys(row).find(k => 
+                  /Component[\s_]*Name|^name$|^desc|^value$|^part[\s_]*type$|Item[\s_]*Description/i.test(cleanString(k))
+                );
+                const optKey = Object.keys(row).find(k => 
+                  /Optional|^opt$|^dnp$/i.test(cleanString(k))
+                );
+                
+                const designatorRaw = cleanString(designatorKey ? row[designatorKey] : Object.values(row)[0]).toUpperCase();
+                const designators = designatorRaw.split(',').map(d => d.trim()).filter(d => d);
+                
+                if (designators.length === 0 && !pnKey) return [];
 
-              return (designators.length > 0 ? designators : ['']).map(d => {
-                const newRow: any = {};
-                Object.keys(row).forEach(key => {
-                  newRow[key] = cleanString(row[key]);
+                return (designators.length > 0 ? designators : ['']).map(d => {
+                  const newRow: any = {};
+                  Object.keys(row).forEach(key => {
+                    newRow[key] = cleanString(row[key]);
+                  });
+                  
+                  newRow["Part Reference"] = d;
+                  newRow["Part Number"] = cleanString(pnKey ? row[pnKey] : '');
+                  newRow["Component_Name"] = cleanString(nameKey ? row[nameKey] : '');
+                  newRow["Optional"] = cleanString(optKey ? row[optKey] : '');
+                  
+                  return newRow as BOMEntry;
                 });
-                
-                newRow["Part Reference"] = d;
-                newRow["Part Number"] = cleanString(pnKey ? row[pnKey] : '');
-                newRow["Component_Name"] = cleanString(nameKey ? row[nameKey] : '');
-                newRow["Optional"] = cleanString(optKey ? row[optKey] : '');
-                
-                return newRow as BOMEntry;
               });
-            });
 
-            const finalData = processedData.filter(d => d["Part Reference"]);
-            setBomFiles(prev => ({ ...prev, [file.name]: sortBOMData(finalData) }));
-            setActiveBom(file.name);
+              const finalData = processedData.filter(d => d["Part Reference"]);
+              setBomFiles(prev => ({ ...prev, [file.name]: sortBOMData(finalData) }));
+              setActiveBom(file.name);
+            } catch (err) {
+              console.error('Excel parsing failed, falling back to text parsing:', err);
+              const textReader = new FileReader();
+              textReader.onload = (textEvent) => {
+                const text = textEvent.target?.result as string;
+                processTextContent(text, file.name);
+              };
+              textReader.readAsText(file);
+            }
           };
           reader.readAsArrayBuffer(file);
         } else if (isTextFile) {
           const reader = new FileReader();
           reader.onload = (event) => {
-            let text = event.target?.result as string;
-            // Strip BOM if present
-            if (text.charCodeAt(0) === 0xFEFF) {
-              text = text.substring(1);
-            }
-            const lines = text.split(/\r?\n/).filter(line => line.trim());
-            
-            if (lines.length === 0) return;
-
-            // Check if the first line looks like a header
-            const firstLine = lines[0];
-            const isTabSeparated = firstLine.includes('\t');
-            const isCommaSeparated = firstLine.includes(',');
-            const delimiter = isTabSeparated ? '\t' : (isCommaSeparated ? ',' : /\s{2,}/);
-            
-            // Split all lines into a grid
-            const grid = lines.map(line => line.split(delimiter).map(p => cleanString(p)));
-            
-            let refIdx = -1;
-            let pnIdx = -1;
-            let nameIdx = -1;
-            let optIdx = -1;
-
-            // Check if we have a valid grid
-            if (grid.length > 0) {
-              const numCols = Math.max(...grid.map(row => row.length));
-              
-              // If it's just 1 column, the delimiter is probably wrong, or it's unstructured
-              if (numCols > 1) {
-                // Analyze each column to guess its type
-                for (let col = 0; col < numCols; col++) {
-                  let refScore = 0;
-                  let pnScore = 0;
-                  let nameScore = 0;
-                  let optScore = 0;
-                  
-                  let validRows = 0;
-                  
-                  // Check up to 10 rows to determine column type
-                  for (let row = 0; row < Math.min(grid.length, 10); row++) {
-                    const cell = grid[row][col];
-                    if (!cell) continue;
-                    
-                    // If it's the first row, check if it matches known headers
-                    if (row === 0) {
-                      if (/Part[\s_]*Referenc|^Reference$|^RefDes$|^Designator$|^Ref$|^Location$|^Part$/i.test(cell)) refScore += 10;
-                      if (/Part[\s_]*Number|^P\/?N$|^PN$|^Material$|^Item$/i.test(cell)) pnScore += 10;
-                      if (/Component[\s_]*Name|^Name$|^Component$|^Value$|^Part[\s_]*Type$/i.test(cell)) nameScore += 10;
-                      if (/Optional|^Opt$|^DNP$/i.test(cell)) optScore += 10;
-                    }
-                    
-                    validRows++;
-                    
-                    // Data heuristics
-                    if (/^[A-Z]{1,3}\d+[A-Z]?$/i.test(cell)) {
-                      refScore++;
-                    } else if (/^[A-Z0-9-]{6,}$/i.test(cell) && !/\s/.test(cell) && !/OHM|FARAD|VOLT|WATT/i.test(cell)) {
-                      pnScore++;
-                    } else if (/\s/.test(cell) || /OHM|FARAD|VOLT|WATT|RES|CAP|IND|MLCC/i.test(cell)) {
-                      nameScore++;
-                    } else if (/^(N\/A|@|DNP|NO\s*STUFF|OPTIONAL)$/i.test(cell)) {
-                      optScore++;
-                    }
-                  }
-                  
-                  // Assign column based on highest score
-                  if (validRows > 0) {
-                    const maxScore = Math.max(refScore, pnScore, nameScore, optScore);
-                    if (maxScore > 0) { // Only assign if there's some evidence
-                      if (maxScore === refScore && refIdx === -1) refIdx = col;
-                      else if (maxScore === pnScore && pnIdx === -1) pnIdx = col;
-                      else if (maxScore === nameScore && nameIdx === -1) nameIdx = col;
-                      else if (maxScore === optScore && optIdx === -1) optIdx = col;
-                    }
-                  }
-                }
-              }
-            }
-            
-            const processedData: BOMEntry[] = [];
-
-            if (refIdx !== -1 || pnIdx !== -1) {
-              // Structured parsing
-              // Check if the first row is a header row (if it doesn't match data heuristics)
-              let startRow = 0;
-              if (grid.length > 0) {
-                const firstRowRef = refIdx !== -1 ? grid[0][refIdx] : '';
-                const firstRowPn = pnIdx !== -1 ? grid[0][pnIdx] : '';
-                // If the first row's Ref doesn't look like a Ref, or PN doesn't look like a PN, it's probably a header
-                if ((firstRowRef && !/^[A-Z]{1,3}\d+[A-Z]?$/i.test(firstRowRef)) || 
-                    (firstRowPn && !/^[A-Z0-9-]{6,}$/i.test(firstRowPn))) {
-                  startRow = 1;
-                }
-              }
-
-              for (let i = startRow; i < grid.length; i++) {
-                const parts = grid[i];
-                if (parts.length === 0 || (parts.length === 1 && !parts[0])) continue;
-
-                const designatorRaw = refIdx !== -1 ? parts[refIdx] : '';
-                const partNumber = pnIdx !== -1 ? parts[pnIdx] : '';
-                
-                if (!designatorRaw && !partNumber) continue;
-
-                const designators = cleanString(designatorRaw).toUpperCase().split(',').map(d => d.trim()).filter(d => d);
-                
-                (designators.length > 0 ? designators : ['']).forEach(d => {
-                  const entry: BOMEntry = {
-                    "Part Reference": d,
-                    "Part Number": cleanString(partNumber),
-                    "Component_Name": nameIdx !== -1 ? cleanString(parts[nameIdx]) : '',
-                    "Optional": optIdx !== -1 ? cleanString(parts[optIdx]) : '',
-                    description: parts.join(' '),
-                    originalLine: lines[i],
-                    lineNumber: i + 1
-                  };
-                  processedData.push(entry);
-                });
-              }
-            } else {
-              // Fallback to regex-based parsing for unstructured text
-              const designatorRegex = /^[A-Z]{1,3}\d+[A-Z]?$/i;
-              const pnRegex = /^[A-Z0-9-]{6,}$/i;
-              
-              lines.forEach((line, index) => {
-                const parts = line.trim().split(/[\s,\t]+/);
-                let foundDesignators: string[] = [];
-                let foundPN = '';
-                let foundName: string[] = [];
-                
-                for (const part of parts) {
-                  const cleanedPart = cleanString(part);
-                  if (designatorRegex.test(cleanedPart) && !/OHM|FARAD|VOLT|WATT/i.test(cleanedPart)) {
-                    foundDesignators.push(cleanedPart.toUpperCase());
-                  } else if (!foundPN && pnRegex.test(cleanedPart) && !/OHM|FARAD|VOLT|WATT/i.test(cleanedPart)) {
-                    foundPN = cleanedPart;
-                  } else {
-                    foundName.push(cleanedPart);
-                  }
-                }
-                
-                if (foundDesignators.length > 0 || foundPN) {
-                  (foundDesignators.length > 0 ? foundDesignators : ['']).forEach(d => {
-                    processedData.push({
-                      "Part Reference": d,
-                      "Part Number": foundPN,
-                      "Component_Name": foundName.join(' '),
-                      description: cleanString(line),
-                      originalLine: cleanString(line),
-                      lineNumber: index + 1
-                    });
-                  });
-                }
-              });
-            }
-            
-            setBomFiles(prev => ({ ...prev, [file.name]: sortBOMData(processedData) }));
-            setActiveBom(file.name);
+            const text = event.target?.result as string;
+            processTextContent(text, file.name);
           };
           reader.readAsText(file);
         } else {
@@ -383,13 +397,13 @@ export default function App() {
               const data = results.data as any[];
             const processedData = data.flatMap(row => {
               const designatorKey = Object.keys(row).find(k => 
-                /Part[\s_]*Reference|^designator$|^ref$|^reference$|^refdes$|^location$|^part$/i.test(cleanString(k))
+                /Part[\s_]*Reference|^designator$|^ref$|^reference$|^refdes$|^location$|^part$|插件位置/i.test(cleanString(k))
               );
               const pnKey = Object.keys(row).find(k => 
-                /Part[\s_]*Number|^pn$|^p\/n$|^material$|^item$/i.test(cleanString(k))
+                /Part[\s_]*Number|^pn$|^p\/n$|^material$|^item$|Item[\s_]*Number/i.test(cleanString(k))
               );
               const nameKey = Object.keys(row).find(k => 
-                /Component[\s_]*Name|^name$|^desc|^value$|^part[\s_]*type$/i.test(cleanString(k))
+                /Component[\s_]*Name|^name$|^desc|^value$|^part[\s_]*type$|Item[\s_]*Description/i.test(cleanString(k))
               );
               const optKey = Object.keys(row).find(k => 
                 /Optional|^opt$|^dnp$/i.test(cleanString(k))
