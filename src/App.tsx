@@ -341,6 +341,7 @@ export default function App() {
         let pnIdx = -1;
         let nameIdx = -1;
         let optIdx = -1;
+        let compTypeIdx = -1;
 
         // Check if we have a valid grid
         if (grid.length > 0) {
@@ -354,6 +355,7 @@ export default function App() {
               let pnScore = 0;
               let nameScore = 0;
               let optScore = 0;
+              let compTypeScore = 0;
               
               let validRows = 0;
               
@@ -368,6 +370,7 @@ export default function App() {
                   if (/Part[\s_]*Number|^P\/?N$|^PN$|^Material$|^Item$|Item[\s_]*Number/i.test(cell)) pnScore += 10;
                   if (/Component[\s_]*Name|^Name$|^Component$|^Value$|^Part[\s_]*Type$|Item[\s_]*Description/i.test(cell)) nameScore += 10;
                   if (/Optional|^Opt$|^DNP$/i.test(cell)) optScore += 10;
+                  if (/Comp[\s_]*Type|^Type$/i.test(cell)) compTypeScore += 10;
                 }
                 
                 validRows++;
@@ -381,17 +384,20 @@ export default function App() {
                   nameScore++;
                 } else if (/^(N\/A|@|DNP|NO\s*STUFF|OPTIONAL)$/i.test(cell)) {
                   optScore++;
+                } else if (/^[S]$/i.test(cell)) {
+                  compTypeScore++;
                 }
               }
               
               // Assign column based on highest score
               if (validRows > 0) {
-                const maxScore = Math.max(refScore, pnScore, nameScore, optScore);
+                const maxScore = Math.max(refScore, pnScore, nameScore, optScore, compTypeScore);
                 if (maxScore > 0) { // Only assign if there's some evidence
                   if (maxScore === refScore && refIdx === -1) refIdx = col;
                   else if (maxScore === pnScore && pnIdx === -1) pnIdx = col;
                   else if (maxScore === nameScore && nameIdx === -1) nameIdx = col;
                   else if (maxScore === optScore && optIdx === -1) optIdx = col;
+                  else if (maxScore === compTypeScore && compTypeIdx === -1) compTypeIdx = col;
                 }
               }
             }
@@ -399,6 +405,7 @@ export default function App() {
         }
         
         const processedData: BOMEntry[] = [];
+        let lastDesignators: string[] = [];
 
         if (refIdx !== -1 || pnIdx !== -1) {
           // Structured parsing
@@ -420,23 +427,41 @@ export default function App() {
 
             const designatorRaw = refIdx !== -1 ? parts[refIdx] : '';
             const partNumber = pnIdx !== -1 ? parts[pnIdx] : '';
+            const compType = compTypeIdx !== -1 ? parts[compTypeIdx] : '';
             
             if (!designatorRaw && !partNumber) continue;
 
             const designators = cleanString(designatorRaw).toUpperCase().split(',').map(d => d.trim()).filter(d => d);
             
-            (designators.length > 0 ? designators : ['']).forEach(d => {
-              const entry: BOMEntry = {
-                "Part Reference": d,
-                "Part Number": cleanString(partNumber),
-                "Component_Name": nameIdx !== -1 ? cleanString(parts[nameIdx]) : '',
-                "Optional": optIdx !== -1 ? cleanString(parts[optIdx]) : '',
-                description: parts.join(' '),
-                originalLine: lines[i],
-                lineNumber: i + 1
-              };
-              processedData.push(entry);
-            });
+            if (designators.length > 0) {
+              lastDesignators = designators;
+              designators.forEach(d => {
+                const entry: BOMEntry = {
+                  "Part Reference": d,
+                  "Part Number": cleanString(partNumber),
+                  "Component_Name": nameIdx !== -1 ? cleanString(parts[nameIdx]) : '',
+                  "Optional": optIdx !== -1 ? cleanString(parts[optIdx]) : '',
+                  description: parts.join(' '),
+                  originalLine: lines[i],
+                  lineNumber: i + 1
+                };
+                processedData.push(entry);
+              });
+            } else if (partNumber && compType.toLowerCase() === 's' && lastDesignators.length > 0) {
+              // Second source for last seen designators
+              lastDesignators.forEach(d => {
+                // Find all entries for this designator that were added in the previous step
+                // Since we process row by row, we can just look at the most recent entries
+                for (let j = processedData.length - 1; j >= 0; j--) {
+                  if (processedData[j]["Part Reference"] === d) {
+                    const existingPn = processedData[j]["Part Number"];
+                    processedData[j]["Part Number"] = existingPn ? `${existingPn} / ${cleanString(partNumber)}` : cleanString(partNumber);
+                    // Only update the most recent one for this designator
+                    break;
+                  }
+                }
+              });
+            }
           }
         } else {
           // Fallback to regex-based parsing for unstructured text
@@ -493,7 +518,10 @@ export default function App() {
               const worksheet = workbook.Sheets[firstSheetName];
               const jsonData = XLSX.utils.sheet_to_json(worksheet);
               
-              const processedData = jsonData.flatMap((row: any) => {
+              let lastDesignators: string[] = [];
+              const processedData: BOMEntry[] = [];
+              
+              jsonData.forEach((row: any) => {
                 const designatorKey = Object.keys(row).find(k => 
                   /Part[\s_]*Reference|^designator$|^ref$|^reference$|^refdes$|^location$|^part$|插件位置/i.test(cleanString(k))
                 );
@@ -506,25 +534,42 @@ export default function App() {
                 const optKey = Object.keys(row).find(k => 
                   /Optional|^opt$|^dnp$/i.test(cleanString(k))
                 );
+                const compTypeKey = Object.keys(row).find(k => 
+                  /Comp[\s_]*Type|^Type$/i.test(cleanString(k))
+                );
                 
                 const designatorRaw = cleanString(designatorKey ? row[designatorKey] : Object.values(row)[0]).toUpperCase();
                 const designators = designatorRaw.split(',').map(d => d.trim()).filter(d => d);
+                const partNumber = cleanString(pnKey ? row[pnKey] : '');
+                const compType = cleanString(compTypeKey ? row[compTypeKey] : '');
                 
-                if (designators.length === 0 && !pnKey) return [];
-
-                return (designators.length > 0 ? designators : ['']).map(d => {
-                  const newRow: any = {};
-                  Object.keys(row).forEach(key => {
-                    newRow[key] = cleanString(row[key]);
+                if (designators.length > 0) {
+                  lastDesignators = designators;
+                  designators.forEach(d => {
+                    const newRow: any = {};
+                    Object.keys(row).forEach(key => {
+                      newRow[key] = cleanString(row[key]);
+                    });
+                    
+                    newRow["Part Reference"] = d;
+                    newRow["Part Number"] = partNumber;
+                    newRow["Component_Name"] = cleanString(nameKey ? row[nameKey] : '');
+                    newRow["Optional"] = cleanString(optKey ? row[optKey] : '');
+                    
+                    processedData.push(newRow as BOMEntry);
                   });
-                  
-                  newRow["Part Reference"] = d;
-                  newRow["Part Number"] = cleanString(pnKey ? row[pnKey] : '');
-                  newRow["Component_Name"] = cleanString(nameKey ? row[nameKey] : '');
-                  newRow["Optional"] = cleanString(optKey ? row[optKey] : '');
-                  
-                  return newRow as BOMEntry;
-                });
+                } else if (partNumber && compType.toLowerCase() === 's' && lastDesignators.length > 0) {
+                  // Second source for last seen designators
+                  lastDesignators.forEach(d => {
+                    for (let j = processedData.length - 1; j >= 0; j--) {
+                      if (processedData[j]["Part Reference"] === d) {
+                        const existingPn = processedData[j]["Part Number"];
+                        processedData[j]["Part Number"] = existingPn ? `${existingPn} / ${partNumber}` : partNumber;
+                        break;
+                      }
+                    }
+                  });
+                }
               });
 
               const finalData = processedData.filter(d => d["Part Reference"]);
@@ -555,7 +600,8 @@ export default function App() {
             skipEmptyLines: true,
             complete: (results) => {
               const data = results.data as any[];
-            const processedData = data.flatMap(row => {
+            let lastDesignators: string[] = [];
+            const processedData = data.reduce((acc: BOMEntry[], row: any) => {
               const designatorKey = Object.keys(row).find(k => 
                 /Part[\s_]*Reference|^designator$|^ref$|^reference$|^refdes$|^location$|^part$|插件位置/i.test(cleanString(k))
               );
@@ -568,26 +614,44 @@ export default function App() {
               const optKey = Object.keys(row).find(k => 
                 /Optional|^opt$|^dnp$/i.test(cleanString(k))
               );
+              const compTypeKey = Object.keys(row).find(k => 
+                /Comp[\s_]*Type|^Type$/i.test(cleanString(k))
+              );
               
               const designatorRaw = cleanString(designatorKey ? row[designatorKey] : Object.values(row)[0]).toUpperCase();
               const designators = designatorRaw.split(',').map(d => d.trim()).filter(d => d);
+              const partNumber = cleanString(pnKey ? row[pnKey] : '');
+              const compType = cleanString(compTypeKey ? row[compTypeKey] : '');
               
-              if (designators.length === 0 && !pnKey) return [];
-
-              return (designators.length > 0 ? designators : ['']).map(d => {
-                const newRow: any = {};
-                Object.keys(row).forEach(key => {
-                  newRow[key] = cleanString(row[key]);
+              if (designators.length > 0) {
+                lastDesignators = designators;
+                designators.forEach(d => {
+                  const newRow: any = {};
+                  Object.keys(row).forEach(key => {
+                    newRow[key] = cleanString(row[key]);
+                  });
+                  
+                  newRow["Part Reference"] = d;
+                  newRow["Part Number"] = partNumber;
+                  newRow["Component_Name"] = cleanString(nameKey ? row[nameKey] : '');
+                  newRow["Optional"] = cleanString(optKey ? row[optKey] : '');
+                  
+                  acc.push(newRow as BOMEntry);
                 });
-                
-                newRow["Part Reference"] = d;
-                newRow["Part Number"] = cleanString(pnKey ? row[pnKey] : '');
-                newRow["Component_Name"] = cleanString(nameKey ? row[nameKey] : '');
-                newRow["Optional"] = cleanString(optKey ? row[optKey] : '');
-                
-                return newRow as BOMEntry;
-              });
-            });
+              } else if (partNumber && compType.toLowerCase() === 's' && lastDesignators.length > 0) {
+                // Second source for last seen designators
+                lastDesignators.forEach(d => {
+                  for (let j = acc.length - 1; j >= 0; j--) {
+                    if (acc[j]["Part Reference"] === d) {
+                      const existingPn = acc[j]["Part Number"];
+                      acc[j]["Part Number"] = existingPn ? `${existingPn} / ${partNumber}` : partNumber;
+                      break;
+                    }
+                  }
+                });
+              }
+              return acc;
+            }, []);
               const finalData = processedData.filter(d => d["Part Reference"]);
               setBomFiles(prev => ({ ...prev, [file.name]: sortBOMData(finalData) }));
               setActiveBom(file.name);
