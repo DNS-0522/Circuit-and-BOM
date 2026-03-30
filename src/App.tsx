@@ -8,7 +8,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
-import { Upload, FileText, Search, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, ChevronDown, Info, AlertCircle, Sun, Moon, Bug, X, Map, Check, Download } from 'lucide-react';
+import { Upload, FileText, Search, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, ChevronDown, Info, AlertCircle, Sun, Moon, Bug, X, Map, Check, Download, Trash2 } from 'lucide-react';
 import { cn } from './lib/utils';
 
 // Set up PDF.js worker
@@ -94,6 +94,39 @@ export default function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
 
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const minimapCanvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const groupedBomData = useMemo(() => {
+    const groups: Record<number, BOMEntry[]> = {};
+    const unknownGroup: BOMEntry[] = [];
+
+    bomData.forEach(entry => {
+      const ref = entry["Part Reference"] || "";
+      const match = ref.match(/^[A-Za-z]+[\s_]*(\d{2})/);
+      const page = match ? parseInt(match[1], 10) : null;
+
+      if (page !== null) {
+        if (!groups[page]) groups[page] = [];
+        groups[page].push(entry);
+      } else {
+        unknownGroup.push(entry);
+      }
+    });
+
+    const sortedGroups = Object.keys(groups)
+      .map(Number)
+      .sort((a, b) => a - b)
+      .map(page => ({ page, entries: groups[page] }));
+
+    if (unknownGroup.length > 0) {
+      sortedGroups.push({ page: 9999, entries: unknownGroup });
+    }
+
+    return sortedGroups;
+  }, [bomData]);
+
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -137,6 +170,51 @@ export default function App() {
             return next;
           });
         }
+      } else if (selectedGroup !== null) {
+        const group = groupedBomData.find(g => g.page === selectedGroup);
+        if (group) {
+          if (key === 'c') {
+            setComponentStatuses(prev => {
+              const next = { ...prev };
+              // If all are already confirmed, unconfirm them. Otherwise, confirm all.
+              const allConfirmed = group.entries.every(entry => next[entry["Part Reference"]] === 'confirmed');
+              
+              group.entries.forEach(entry => {
+                const ref = entry["Part Reference"];
+                if (allConfirmed) {
+                  delete next[ref];
+                } else {
+                  next[ref] = 'confirmed';
+                }
+              });
+              return next;
+            });
+          } else if (key === 'd') {
+            setComponentStatuses(prev => {
+              const next = { ...prev };
+              // If all are already doubtful, undoubt them. Otherwise, doubt all.
+              const allDoubtful = group.entries.every(entry => next[entry["Part Reference"]] === 'doubtful');
+              
+              group.entries.forEach(entry => {
+                const ref = entry["Part Reference"];
+                if (allDoubtful) {
+                  delete next[ref];
+                } else {
+                  next[ref] = 'doubtful';
+                }
+              });
+              return next;
+            });
+          } else if (key === 'x') {
+            setComponentStatuses(prev => {
+              const next = { ...prev };
+              group.entries.forEach(entry => {
+                delete next[entry["Part Reference"]];
+              });
+              return next;
+            });
+          }
+        }
       }
 
       // Navigation shortcuts
@@ -149,40 +227,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedDesignator, pdfDoc]);
-
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const minimapCanvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  const groupedBomData = useMemo(() => {
-    const groups: Record<number, BOMEntry[]> = {};
-    const unknownGroup: BOMEntry[] = [];
-
-    bomData.forEach(entry => {
-      const ref = entry["Part Reference"] || "";
-      const match = ref.match(/^[A-Za-z]+[\s_]*(\d{2})/);
-      const page = match ? parseInt(match[1], 10) : null;
-
-      if (page !== null) {
-        if (!groups[page]) groups[page] = [];
-        groups[page].push(entry);
-      } else {
-        unknownGroup.push(entry);
-      }
-    });
-
-    const sortedGroups = Object.keys(groups)
-      .map(Number)
-      .sort((a, b) => a - b)
-      .map(page => ({ page, entries: groups[page] }));
-
-    if (unknownGroup.length > 0) {
-      sortedGroups.push({ page: 9999, entries: unknownGroup });
-    }
-
-    return sortedGroups;
-  }, [bomData]);
+  }, [selectedDesignator, selectedGroup, groupedBomData, pdfDoc]);
 
   // Update viewport rect for minimap
   useEffect(() => {
@@ -315,6 +360,10 @@ export default function App() {
         }
       }
     }
+
+    // Clear selection if clicked on empty space
+    setSelectedDesignator(null);
+    setSelectedGroup(null);
   };
 
   // Auto-scroll BOM list when a designator is selected
@@ -1369,11 +1418,38 @@ export default function App() {
                       </span>
                     </div>
                   </div>
+                  <div className="mt-2 text-[9px] text-neutral-400 italic">
+                    Tip: Select a page to apply status to all components on that page.
+                  </div>
                 </div>
 
                 {Object.keys(bomFiles).length > 0 && (
                   <div className="mb-4">
-                    <label className="text-xs font-bold uppercase text-neutral-500">Active BOM</label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-xs font-bold uppercase text-neutral-500">Active BOM</label>
+                      <button
+                        onClick={() => {
+                          if (!activeBom) return;
+                          setBomFiles(prev => {
+                            const next = { ...prev };
+                            delete next[activeBom];
+                            
+                            // Update activeBom to the next available one, or null
+                            const remaining = Object.keys(next);
+                            setActiveBom(remaining.length > 0 ? remaining[0] : null);
+                            
+                            return next;
+                          });
+                        }}
+                        className={cn(
+                          "p-1 rounded transition-colors text-red-500 hover:bg-red-500/10",
+                          isDarkMode ? "hover:text-red-400" : "hover:text-red-600"
+                        )}
+                        title="Delete Active BOM"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
                     <select 
                       value={activeBom || ""} 
                       onChange={(e) => setActiveBom(e.target.value)}
@@ -1717,10 +1793,10 @@ export default function App() {
           {/* Info Panel Overlay */}
           {selectedDesignator && (
             <div className={cn(
-              "absolute bottom-6 right-6 w-80 shadow-2xl rounded-xl border overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-300 z-30 transition-colors",
+              "absolute bottom-6 right-6 w-80 max-h-[calc(100vh-200px)] flex flex-col shadow-2xl rounded-xl border overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-300 z-30 transition-colors",
               isDarkMode ? "bg-neutral-800 border-neutral-700" : "bg-white border-neutral-200"
             )}>
-              <div className="bg-red-600 p-4 text-white flex items-center justify-between">
+              <div className="bg-red-600 p-4 shrink-0 text-white flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Info className="w-5 h-5" />
                   <span className="font-bold tracking-tight">{selectedDesignator}</span>
@@ -1735,11 +1811,11 @@ export default function App() {
                     </span>
                   )}
                 </div>
-                <button onClick={() => setSelectedDesignator(null)} className="hover:bg-red-700 p-1 rounded">
+                <button onClick={() => setSelectedDesignator(null)} className="hover:bg-red-700 p-1 rounded shrink-0">
                   <ChevronRight className="w-4 h-4 rotate-90" />
                 </button>
               </div>
-              <div className="p-4 space-y-3">
+              <div className="p-4 space-y-3 overflow-y-auto">
                 {selectedBomEntry ? (
                   <>
                     {selectedBomEntry.originalLine && (
@@ -1778,56 +1854,55 @@ export default function App() {
                     <p className="text-xs font-medium">Component not found in BOM data.</p>
                   </div>
                 )}
-                
-                <div className={cn(
-                  "pt-2 border-t",
-                  isDarkMode ? "border-neutral-700" : "border-neutral-100"
-                )}>
-                  <div className="flex gap-2 mb-3">
-                    <button 
-                      onClick={() => setComponentStatuses(prev => ({...prev, [selectedDesignator]: 'confirmed'}))}
-                      className={cn(
-                        "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
-                        componentStatuses[selectedDesignator] === 'confirmed' 
-                          ? "bg-green-600 text-white shadow-lg scale-105" 
-                          : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
-                      )}
-                    >
-                      Confirm
-                    </button>
-                    <button 
-                      onClick={() => setComponentStatuses(prev => ({...prev, [selectedDesignator]: 'doubtful'}))}
-                      className={cn(
-                        "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
-                        componentStatuses[selectedDesignator] === 'doubtful' 
-                          ? "bg-red-600 text-white shadow-lg scale-105" 
-                          : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
-                      )}
-                    >
-                      Doubt
-                    </button>
-                    <button 
-                      onClick={() => setComponentStatuses(prev => {
-                        const next = {...prev};
-                        delete next[selectedDesignator];
-                        return next;
-                      })}
-                      className={cn(
-                        "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
-                        !componentStatuses[selectedDesignator] 
-                          ? (isDarkMode ? "bg-neutral-600 text-white" : "bg-neutral-300 text-neutral-700")
-                          : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
-                      )}
-                    >
-                      Reset
-                    </button>
-                  </div>
-                  <p className="text-[10px] text-neutral-400 italic">
-                    {matches.length > 0 
-                      ? `Found ${matches.length} instance(s) on this page.`
-                      : "Searching for component on this page..."}
-                  </p>
+              </div>
+              <div className={cn(
+                "p-4 pt-3 border-t shrink-0",
+                isDarkMode ? "border-neutral-700 bg-neutral-800" : "border-neutral-100 bg-white"
+              )}>
+                <div className="flex gap-2 mb-2">
+                  <button 
+                    onClick={() => setComponentStatuses(prev => ({...prev, [selectedDesignator]: 'confirmed'}))}
+                    className={cn(
+                      "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
+                      componentStatuses[selectedDesignator] === 'confirmed' 
+                        ? "bg-green-600 text-white shadow-lg scale-105" 
+                        : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
+                    )}
+                  >
+                    Confirm
+                  </button>
+                  <button 
+                    onClick={() => setComponentStatuses(prev => ({...prev, [selectedDesignator]: 'doubtful'}))}
+                    className={cn(
+                      "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
+                      componentStatuses[selectedDesignator] === 'doubtful' 
+                        ? "bg-red-600 text-white shadow-lg scale-105" 
+                        : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
+                    )}
+                  >
+                    Doubt
+                  </button>
+                  <button 
+                    onClick={() => setComponentStatuses(prev => {
+                      const next = {...prev};
+                      delete next[selectedDesignator];
+                      return next;
+                    })}
+                    className={cn(
+                      "flex-1 py-1.5 rounded text-[10px] font-bold uppercase transition-all",
+                      !componentStatuses[selectedDesignator] 
+                        ? (isDarkMode ? "bg-neutral-600 text-white" : "bg-neutral-300 text-neutral-700")
+                        : (isDarkMode ? "bg-neutral-700 text-neutral-400 hover:bg-neutral-600" : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200")
+                    )}
+                  >
+                    Reset
+                  </button>
                 </div>
+                <p className="text-[10px] text-neutral-400 italic">
+                  {matches.length > 0 
+                    ? `Found ${matches.length} instance(s) on this page.`
+                    : "Searching for component on this page..."}
+                </p>
               </div>
             </div>
           )}
