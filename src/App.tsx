@@ -7,7 +7,8 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
-import { Upload, FileText, Search, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, ChevronDown, Info, AlertCircle, Sun, Moon, Bug, X, Map, Check } from 'lucide-react';
+import { jsPDF } from 'jspdf';
+import { Upload, FileText, Search, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, ChevronDown, Info, AlertCircle, Sun, Moon, Bug, X, Map, Check, Download } from 'lucide-react';
 import { cn } from './lib/utils';
 
 // Set up PDF.js worker
@@ -90,6 +91,65 @@ export default function App() {
   const [showMinimap, setShowMinimap] = useState(true);
   const [viewportRect, setViewportRect] = useState({ top: 0, left: 0, width: 0, height: 0 });
   const [componentStatuses, setComponentStatuses] = useState<Record<string, 'confirmed' | 'doubtful'>>({});
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ignore if user is typing in an input or textarea
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      const key = e.key.toLowerCase();
+
+      // Status shortcuts
+      if (selectedDesignator) {
+        if (key === 'c') {
+          setComponentStatuses(prev => {
+            const next = { ...prev };
+            if (next[selectedDesignator] === 'confirmed') {
+              delete next[selectedDesignator];
+            } else {
+              next[selectedDesignator] = 'confirmed';
+              // Also clear doubtful if it was set
+              if (next[selectedDesignator] === 'doubtful') delete next[selectedDesignator];
+            }
+            return next;
+          });
+        } else if (key === 'd') {
+          setComponentStatuses(prev => {
+            const next = { ...prev };
+            if (next[selectedDesignator] === 'doubtful') {
+              delete next[selectedDesignator];
+            } else {
+              next[selectedDesignator] = 'doubtful';
+              // Also clear confirmed if it was set
+              if (next[selectedDesignator] === 'confirmed') delete next[selectedDesignator];
+            }
+            return next;
+          });
+        } else if (key === 'x') {
+          setComponentStatuses(prev => {
+            const next = { ...prev };
+            delete next[selectedDesignator];
+            return next;
+          });
+        }
+      }
+
+      // Navigation shortcuts
+      if (key === 'arrowleft') {
+        setCurrentPage(prev => Math.max(1, prev - 1));
+      } else if (key === 'arrowright') {
+        setCurrentPage(prev => Math.min(pdfDoc?.numPages || 1, prev + 1));
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedDesignator, pdfDoc]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const minimapCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -918,6 +978,97 @@ export default function App() {
     setMatches(prev => [...prev, ...foundMatches]);
   };
 
+  const exportToExcel = () => {
+    if (bomData.length === 0) return;
+
+    const dataToExport = bomData.map(entry => ({
+      "Part Reference": entry["Part Reference"],
+      "Part Number": entry["Part Number"] || "",
+      "Component Name": entry["Component_Name"] || "",
+      "Status": componentStatuses[entry["Part Reference"]] || "Pending",
+      "Optional": entry["Optional"] || ""
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(dataToExport);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "BOM Status");
+    XLSX.writeFile(workbook, `BOM_Status_Export_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
+  const exportToPdf = async () => {
+    if (!pdfDoc) return;
+
+    setIsExporting(true);
+    setExportProgress(0);
+
+    const pdf = new jsPDF({
+      orientation: 'landscape',
+      unit: 'px',
+      format: 'a4'
+    });
+
+    const confirmed = Object.keys(componentStatuses).filter(d => componentStatuses[d] === 'confirmed');
+    const doubtful = Object.keys(componentStatuses).filter(d => componentStatuses[d] === 'doubtful');
+
+    for (let i = 1; i <= pdfDoc.numPages; i++) {
+      setExportProgress(Math.round((i / pdfDoc.numPages) * 100));
+      const page = await pdfDoc.getPage(i);
+      const viewport = page.getViewport({ scale: 2 }); // Higher scale for better quality
+      
+      const tempCanvas = document.createElement('canvas');
+      const tempCtx = tempCanvas.getContext('2d')!;
+      tempCanvas.width = viewport.width;
+      tempCanvas.height = viewport.height;
+
+      await page.render({
+        canvasContext: tempCtx,
+        viewport: viewport
+      }).promise;
+
+      // Draw highlights
+      const textContent = await page.getTextContent();
+      const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      
+      const drawHighlights = (terms: string[], color: string) => {
+        const regexes = terms.map(term => new RegExp(`\\b${escapeRegExp(term)}[A-Za-z]*\\b`, 'i'));
+        textContent.items.forEach((item: any) => {
+          if ('str' in item) {
+            const matchIdx = regexes.findIndex((regex, idx) => regex.test(item.str) || item.str === terms[idx]);
+            if (matchIdx !== -1) {
+              const tx = pdfjsLib.Util.transform(
+                pdfjsLib.Util.transform(viewport.transform, item.transform),
+                [1, 0, 0, -1, 0, 0]
+              );
+              tempCtx.strokeStyle = color;
+              tempCtx.lineWidth = 4;
+              tempCtx.strokeRect(tx[4], tx[5] - item.height * 2, item.width * 2, item.height * 2);
+              tempCtx.fillStyle = color + '22';
+              tempCtx.fillRect(tx[4], tx[5] - item.height * 2, item.width * 2, item.height * 2);
+            }
+          }
+        });
+      };
+
+      if (confirmed.length > 0) drawHighlights(confirmed, '#22c55e');
+      if (doubtful.length > 0) drawHighlights(doubtful, '#ef4444');
+
+      const imgData = tempCanvas.toDataURL('image/jpeg', 0.8);
+      
+      if (i > 1) pdf.addPage();
+      
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = pdf.internal.pageSize.getHeight();
+      const ratio = Math.min(pdfWidth / viewport.width, pdfHeight / viewport.height);
+      const imgWidth = viewport.width * ratio;
+      const imgHeight = viewport.height * ratio;
+      
+      pdf.addImage(imgData, 'JPEG', (pdfWidth - imgWidth) / 2, (pdfHeight - imgHeight) / 2, imgWidth, imgHeight);
+    }
+
+    pdf.save(`Marked_BOM_PDF_${new Date().toISOString().slice(0, 10)}.pdf`);
+    setIsExporting(false);
+  };
+
   const selectedBomEntry = useMemo(() => {
     if (isComparing && comparisonResults && selectedDesignator) {
       const result = comparisonResults.find(r => r.designator === selectedDesignator);
@@ -967,6 +1118,43 @@ export default function App() {
         </div>
         
         <div className="flex items-center gap-4">
+          {pdfDoc && bomData.length > 0 && (
+            <div className="flex items-center gap-2 mr-2 border-r pr-4 border-neutral-200 dark:border-neutral-700">
+              <button
+                onClick={exportToExcel}
+                className={cn(
+                  "flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium transition-all",
+                  isDarkMode ? "bg-neutral-700 hover:bg-neutral-600 text-neutral-200" : "bg-neutral-100 hover:bg-neutral-200 text-neutral-700"
+                )}
+                title="Export BOM with Status to Excel"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Excel
+              </button>
+              <button
+                onClick={exportToPdf}
+                disabled={isExporting}
+                className={cn(
+                  "flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium transition-all",
+                  isExporting ? "opacity-50 cursor-not-allowed" : "",
+                  isDarkMode ? "bg-red-900/30 hover:bg-red-900/50 text-red-400" : "bg-red-50 hover:bg-red-100 text-red-600"
+                )}
+                title="Export Marked PDF with Highlights"
+              >
+                {isExporting ? (
+                  <>
+                    <div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                    {exportProgress}%
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-3.5 h-3.5" />
+                    Marked PDF
+                  </>
+                )}
+              </button>
+            </div>
+          )}
           <button 
             onClick={() => setIsDarkMode(!isDarkMode)}
             className={cn(
@@ -1151,15 +1339,27 @@ export default function App() {
                   <div className="flex flex-wrap gap-3">
                     <div className="flex items-center gap-1.5">
                       <div className="w-2 h-2 rounded-full bg-green-500" />
-                      <span className="text-[10px]">Confirmed</span>
+                      <span className="text-[10px] flex items-center gap-1">
+                        Confirmed 
+                        <kbd className="px-1.5 py-0.5 rounded border border-neutral-400 dark:border-neutral-500 bg-neutral-200 dark:bg-neutral-700 text-neutral-800 dark:text-neutral-200 text-[9px] font-mono leading-none shadow-sm">C</kbd>
+                      </span>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <div className="w-2 h-2 rounded-full bg-red-500" />
-                      <span className="text-[10px]">Doubtful</span>
+                      <span className="text-[10px] flex items-center gap-1">
+                        Doubtful 
+                        <kbd className="px-1.5 py-0.5 rounded border border-neutral-400 dark:border-neutral-500 bg-neutral-200 dark:bg-neutral-700 text-neutral-800 dark:text-neutral-200 text-[9px] font-mono leading-none shadow-sm">D</kbd>
+                      </span>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <div className="w-2 h-2 rounded-full bg-blue-500" />
                       <span className="text-[10px]">Selected</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] flex items-center gap-1 text-neutral-400">
+                        Clear 
+                        <kbd className="px-1.5 py-0.5 rounded border border-neutral-400 dark:border-neutral-500 bg-neutral-200 dark:bg-neutral-700 text-neutral-800 dark:text-neutral-200 text-[9px] font-mono leading-none shadow-sm">X</kbd>
+                      </span>
                     </div>
                   </div>
                 </div>
