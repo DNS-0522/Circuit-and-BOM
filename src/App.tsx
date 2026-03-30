@@ -1001,10 +1001,14 @@ export default function App() {
     setIsExporting(true);
     setExportProgress(0);
 
+    // Get first page to initialize PDF with correct orientation/size
+    const firstPage = await pdfDoc.getPage(1);
+    const firstViewport = firstPage.getViewport({ scale: 1 });
+    
     const pdf = new jsPDF({
-      orientation: 'landscape',
+      orientation: firstViewport.width > firstViewport.height ? 'landscape' : 'portrait',
       unit: 'px',
-      format: 'a4'
+      format: [firstViewport.width, firstViewport.height]
     });
 
     const confirmed = Object.keys(componentStatuses).filter(d => componentStatuses[d] === 'confirmed');
@@ -1013,12 +1017,18 @@ export default function App() {
     for (let i = 1; i <= pdfDoc.numPages; i++) {
       setExportProgress(Math.round((i / pdfDoc.numPages) * 100));
       const page = await pdfDoc.getPage(i);
-      const viewport = page.getViewport({ scale: 2 }); // Higher scale for better quality
+      const originalViewport = page.getViewport({ scale: 1 });
+      const exportScale = 3; // Increased scale for better quality (3x is usually a good balance)
+      const viewport = page.getViewport({ scale: exportScale });
       
       const tempCanvas = document.createElement('canvas');
       const tempCtx = tempCanvas.getContext('2d')!;
       tempCanvas.width = viewport.width;
       tempCanvas.height = viewport.height;
+
+      // Set white background for the canvas (PDFs often have transparent backgrounds)
+      tempCtx.fillStyle = '#FFFFFF';
+      tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
 
       await page.render({
         canvasContext: tempCtx,
@@ -1040,10 +1050,10 @@ export default function App() {
                 [1, 0, 0, -1, 0, 0]
               );
               tempCtx.strokeStyle = color;
-              tempCtx.lineWidth = 4;
-              tempCtx.strokeRect(tx[4], tx[5] - item.height * 2, item.width * 2, item.height * 2);
+              tempCtx.lineWidth = 4 * (exportScale / 2); // Scale line width with export scale
+              tempCtx.strokeRect(tx[4], tx[5] - item.height * exportScale, item.width * exportScale, item.height * exportScale);
               tempCtx.fillStyle = color + '22';
-              tempCtx.fillRect(tx[4], tx[5] - item.height * 2, item.width * 2, item.height * 2);
+              tempCtx.fillRect(tx[4], tx[5] - item.height * exportScale, item.width * exportScale, item.height * exportScale);
             }
           }
         });
@@ -1052,17 +1062,14 @@ export default function App() {
       if (confirmed.length > 0) drawHighlights(confirmed, '#22c55e');
       if (doubtful.length > 0) drawHighlights(doubtful, '#ef4444');
 
-      const imgData = tempCanvas.toDataURL('image/jpeg', 0.8);
+      // Use PNG for better clarity on lines/text, or high-quality JPEG
+      const imgData = tempCanvas.toDataURL('image/png');
       
-      if (i > 1) pdf.addPage();
+      if (i > 1) {
+        pdf.addPage([originalViewport.width, originalViewport.height], originalViewport.width > originalViewport.height ? 'l' : 'p');
+      }
       
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = pdf.internal.pageSize.getHeight();
-      const ratio = Math.min(pdfWidth / viewport.width, pdfHeight / viewport.height);
-      const imgWidth = viewport.width * ratio;
-      const imgHeight = viewport.height * ratio;
-      
-      pdf.addImage(imgData, 'JPEG', (pdfWidth - imgWidth) / 2, (pdfHeight - imgHeight) / 2, imgWidth, imgHeight);
+      pdf.addImage(imgData, 'PNG', 0, 0, originalViewport.width, originalViewport.height, undefined, 'FAST');
     }
 
     pdf.save(`Marked_BOM_PDF_${new Date().toISOString().slice(0, 10)}.pdf`);
