@@ -428,6 +428,24 @@ export default function App() {
         return String(val).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
       };
 
+      const addBomFileToState = (fileName: string, data: BOMEntry[]) => {
+        setBomFiles(prev => {
+          let uName = fileName;
+          if (prev[uName]) {
+            let counter = 1;
+            const parts = fileName.split('.');
+            const ext = parts.length > 1 ? `.${parts.pop()}` : '';
+            const nameBody = parts.join('.');
+            while (prev[`${nameBody} (${counter})${ext}`]) {
+              counter++;
+            }
+            uName = `${nameBody} (${counter})${ext}`;
+          }
+          setTimeout(() => setActiveBom(uName), 0);
+          return { ...prev, [uName]: sortBOMData(data) };
+        });
+      };
+
       const processTextContent = (text: string, fileName: string) => {
         // Strip BOM if present
         if (text.charCodeAt(0) === 0xFEFF) {
@@ -609,8 +627,7 @@ export default function App() {
           });
         }
         
-        setBomFiles(prev => ({ ...prev, [fileName]: sortBOMData(processedData) }));
-        setActiveBom(fileName);
+        addBomFileToState(fileName, processedData);
       };
 
       Array.from(files).forEach((file: File) => {
@@ -682,8 +699,7 @@ export default function App() {
               });
 
               const finalData = processedData.filter(d => d["Part Reference"]);
-              setBomFiles(prev => ({ ...prev, [file.name]: sortBOMData(finalData) }));
-              setActiveBom(file.name);
+              addBomFileToState(file.name, finalData);
             } catch (err) {
               console.error('Excel parsing failed, falling back to text parsing:', err);
               const textReader = new FileReader();
@@ -762,8 +778,7 @@ export default function App() {
               return acc;
             }, []);
               const finalData = processedData.filter(d => d["Part Reference"]);
-              setBomFiles(prev => ({ ...prev, [file.name]: sortBOMData(finalData) }));
-              setActiveBom(file.name);
+              addBomFileToState(file.name, finalData);
             },
             error: (err) => {
               setError('Failed to parse BOM file.');
@@ -797,9 +812,14 @@ export default function App() {
         results.push({ designator, status: 'added', bom2Entry: entry2, diffFields: [] });
       } else if (entry1 && entry2) {
         const diffFields: string[] = [];
-        if (entry1["Part Number"] !== entry2["Part Number"]) diffFields.push("Part Number");
-        if (entry1["Component_Name"] !== entry2["Component_Name"]) diffFields.push("Component_Name");
-        if (entry1["Optional"] !== entry2["Optional"]) diffFields.push("Optional");
+        const allKeys = Array.from(new Set([...Object.keys(entry1), ...Object.keys(entry2)]))
+          .filter(k => /Part Number|Part_Number|PartNumber|Name/i.test(k));
+          
+        allKeys.forEach(key => {
+          if ((entry1[key] || "") !== (entry2[key] || "")) {
+            diffFields.push(key);
+          }
+        });
 
         if (diffFields.length > 0) {
           results.push({ designator, status: 'modified', bom1Entry: entry1, bom2Entry: entry2, diffFields });
@@ -811,7 +831,7 @@ export default function App() {
 
     setComparisonResults(results);
     setIsComparing(true);
-    setCompareWithBom(bom2Name);
+    setCompareWithBom(bom1Name);
   };
 
   const loadPdf = async (file: File) => {
@@ -1299,7 +1319,7 @@ export default function App() {
                     </button>
                   </div>
                   <p className="text-[10px] opacity-70">
-                    Comparing <span className="font-bold">{activeBom}</span> with <span className="font-bold">{compareWithBom}</span>
+                    Comparing <span className="font-bold">{compareWithBom}</span> with <span className="font-bold">{activeBom}</span>
                   </p>
                   <div className="flex gap-2 mt-1">
                     <div className="flex items-center gap-1">
@@ -1816,34 +1836,115 @@ export default function App() {
                 </button>
               </div>
               <div className="p-4 space-y-3 overflow-y-auto">
-                {selectedBomEntry ? (
+                {selectedBomEntry || (isComparing && comparisonResults?.find(r => r.designator === selectedDesignator)) ? (
                   <>
-                    {selectedBomEntry.originalLine && (
-                      <div className="space-y-1">
-                        <label className={cn(
-                          "text-[10px] uppercase font-bold tracking-wider",
-                          isDarkMode ? "text-neutral-500" : "text-neutral-400"
-                        )}>Source Line (L{selectedBomEntry.lineNumber})</label>
-                        <p className={cn(
-                          "text-xs font-mono break-words p-2 rounded",
-                          isDarkMode ? "bg-neutral-900 text-neutral-300" : "bg-neutral-50 text-neutral-600"
-                        )}>{selectedBomEntry.originalLine}</p>
-                      </div>
-                    )}
-                    {Object.entries(selectedBomEntry).map(([key, value]) => (
-                      !['Part Reference', 'originalLine', 'lineNumber'].includes(key) && value && (
-                        <div key={key} className="space-y-1">
-                          <label className={cn(
-                            "text-[10px] uppercase font-bold tracking-wider",
-                            isDarkMode ? "text-neutral-500" : "text-neutral-400"
-                          )}>{key}</label>
-                          <p className={cn(
-                            "text-sm break-words",
-                            isDarkMode ? "text-neutral-200" : "text-neutral-800"
-                          )}>{String(value)}</p>
-                        </div>
-                      )
-                    ))}
+                    {(() => {
+                      const compResult = isComparing ? comparisonResults?.find(r => r.designator === selectedDesignator) : null;
+                      
+                      if (compResult && compResult.status === 'modified') {
+                        const allKeys = Array.from(new Set([
+                          ...Object.keys(compResult.bom1Entry || {}),
+                          ...Object.keys(compResult.bom2Entry || {})
+                        ])).filter(k => /Part Number|Part_Number|PartNumber|Name/i.test(k))
+                          .sort((a, b) => {
+                            // High priority keys
+                            const isImportant = (k: string) => /Part Number|Component_Name|Name/i.test(k);
+                            const aImportant = isImportant(a);
+                            const bImportant = isImportant(b);
+                            
+                            if (aImportant && !bImportant) return -1;
+                            if (!aImportant && bImportant) return 1;
+                            
+                            // Next, fields that have differences
+                            const aDiff = compResult.diffFields.includes(a);
+                            const bDiff = compResult.diffFields.includes(b);
+                            
+                            if (aDiff && !bDiff) return -1;
+                            if (!aDiff && bDiff) return 1;
+                            
+                            return a.localeCompare(b);
+                          });
+
+                        return (
+                          <div className="space-y-3">
+                            {allKeys.map(key => {
+                              const val1 = compResult.bom1Entry?.[key];
+                              const val2 = compResult.bom2Entry?.[key];
+                              const isDiff = compResult.diffFields.includes(key);
+
+                              if (!val1 && !val2) return null;
+
+                              return (
+                                <div key={key} className={cn("space-y-1 p-2 rounded -mx-2", isDiff ? (isDarkMode ? "bg-red-900/10" : "bg-red-50") : "")}>
+                                  <label className={cn(
+                                    "text-[10px] uppercase font-bold tracking-wider",
+                                    isDiff ? (isDarkMode ? "text-amber-500" : "text-amber-600") : (isDarkMode ? "text-neutral-500" : "text-neutral-400")
+                                  )}>
+                                    {key}
+                                    {isDiff && <span className="ml-2 text-[9px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-600 dark:text-amber-400">Diff</span>}
+                                  </label>
+                                  {isDiff ? (
+                                    <div className="grid grid-cols-2 gap-2 mt-1">
+                                      <div className="space-y-1">
+                                        <div className="text-[9px] uppercase text-neutral-500 truncate" title={compareWithBom || ""}>{compareWithBom}</div>
+                                        <p className={cn(
+                                          "text-xs break-words p-1.5 rounded line-through opacity-70",
+                                          isDarkMode ? "bg-red-900/30 text-red-200" : "bg-red-100 text-red-800"
+                                        )}>{String(val1 || '-')}</p>
+                                      </div>
+                                      <div className="space-y-1">
+                                        <div className="text-[9px] uppercase text-neutral-500 truncate" title={activeBom || ""}>{activeBom}</div>
+                                        <p className={cn(
+                                          "text-xs break-words p-1.5 rounded",
+                                          isDarkMode ? "bg-green-900/30 text-green-200" : "bg-green-100 text-green-800"
+                                        )}>{String(val2 || '-')}</p>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <p className={cn(
+                                      "text-sm break-words",
+                                      isDarkMode ? "text-neutral-200" : "text-neutral-800"
+                                    )}>{String(val1 || val2)}</p>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        );
+                      }
+
+                      // Default view for normal mode, added, removed, or identical status
+                      return (
+                        <>
+                          {selectedBomEntry?.originalLine && (
+                            <div className="space-y-1">
+                              <label className={cn(
+                                "text-[10px] uppercase font-bold tracking-wider",
+                                isDarkMode ? "text-neutral-500" : "text-neutral-400"
+                              )}>Source Line (L{selectedBomEntry.lineNumber})</label>
+                              <p className={cn(
+                                "text-xs font-mono break-words p-2 rounded",
+                                isDarkMode ? "bg-neutral-900 text-neutral-300" : "bg-neutral-50 text-neutral-600"
+                              )}>{selectedBomEntry.originalLine}</p>
+                            </div>
+                          )}
+                          {selectedBomEntry && Object.entries(selectedBomEntry).map(([key, value]) => (
+                            !/Part Reference|originalLine|lineNumber|插件位置|插件數量|Quantity|Qty|位置|數量|Location|Designator/i.test(key) && value && (
+                              <div key={key} className="space-y-1">
+                                <label className={cn(
+                                  "text-[10px] uppercase font-bold tracking-wider",
+                                  isDarkMode ? "text-neutral-500" : "text-neutral-400"
+                                )}>{key}</label>
+                                <p className={cn(
+                                  "text-sm break-words",
+                                  isDarkMode ? "text-neutral-200" : "text-neutral-800"
+                                )}>{String(value)}</p>
+                              </div>
+                            )
+                          ))}
+                        </>
+                      );
+                    })()}
                   </>
                 ) : (
                   <div className={cn(
