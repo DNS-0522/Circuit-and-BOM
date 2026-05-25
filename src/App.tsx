@@ -816,8 +816,15 @@ export default function App() {
           .filter(k => /Part Number|Part_Number|PartNumber|Name/i.test(k));
           
         allKeys.forEach(key => {
-          if ((entry1[key] || "") !== (entry2[key] || "")) {
-            diffFields.push(key);
+          const val1 = String(entry1[key] || "").trim();
+          const val2 = String(entry2[key] || "").trim();
+          
+          if (val1 !== val2) {
+            // Compare independently of order for alternate parts (separated by comma, slash, etc.) and case-insensitively
+            const parse = (s: string) => s.split(/[\/,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean).sort().join('|');
+            if (parse(val1) !== parse(val2)) {
+              diffFields.push(key);
+            }
           }
         });
 
